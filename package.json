@@ -6,7 +6,8 @@
   "scripts": {
     "install": "node-gyp rebuild",
     "test": "node test.js",
-    "electron": "electron electron-app.js"
+    "electron": "electron electron-app.js",
+    "benchmark": "node benchmark.js"
   },
   "keywords": [
     "gstreamer",

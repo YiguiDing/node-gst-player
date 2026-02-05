@@ -31,11 +31,11 @@ private:
     // GStreamer pipeline setup
     bool SetupPipeline();
     bool SetupSharedMemory();
+    void SetupShmAllocator();
     void CleanupPipeline();
     
     // GStreamer callbacks
     static GstFlowReturn OnNewSample(GstAppSink* appsink, gpointer user_data);
-    static GstCaps* OnQueryCaps(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     
     // Helper methods
     void ProcessFrame(GstSample* sample);
@@ -53,6 +53,7 @@ private:
     size_t shm_size_;
     int shm_fd_;
     std::string shm_name_;
+    GstAllocator* shm_allocator_;
     
     // Frame info (updated by GStreamer thread)
     struct FrameInfo {

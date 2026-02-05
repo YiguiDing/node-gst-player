@@ -5,11 +5,48 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <gst/gstallocator.h>
 
 using namespace v8;
 using namespace node;
 
 Persistent<Function> GstPlayer::constructor;
+
+// GStreamer 共享内存分配器回调
+static gpointer shm_alloc(GstAllocator* allocator, gsize size, GstAllocationParams* params) {
+    GstPlayer* player = static_cast<GstPlayer*>(allocator->user_data);
+    if (player && player->shm_data_) {
+        // 直接返回共享内存指针，无需分配新内存
+        return player->shm_data_;
+    }
+    return nullptr;
+}
+
+static void shm_free(GstAllocator* allocator, gpointer memory) {
+    // 共享内存由系统管理，无需释放
+}
+
+static void* shm_mem_map(GstMemory* mem, gsize maxsize, GstMapFlags flags) {
+    GstPlayer* player = static_cast<GstPlayer*>(mem->allocator->user_data);
+    return player ? player->shm_data_ : nullptr;
+}
+
+static gboolean shm_mem_unmap(GstMemory* mem) {
+    return TRUE;
+}
+
+static GstMemory* shm_mem_copy(GstMemory* mem, gssize offset, gssize size) {
+    // 不支持拷贝，返回空引用
+    return gst_memory_ref(mem);
+}
+
+static GstMemory* shm_mem_share(GstMemory* mem, gssize offset, gssize size) {
+    return gst_memory_ref(mem);
+}
+
+static gboolean shm_mem_is_span(GstMemory* mem1, GstMemory* mem2, gsize* offset) {
+    return FALSE;
+}
 
 // Initialize the addon
 void GstPlayer::Init(Local<Object> exports) {
@@ -63,6 +100,7 @@ GstPlayer::GstPlayer()
       shm_data_(nullptr),
       shm_size_(0),
       shm_fd_(-1),
+      shm_allocator_(nullptr),
       is_playing_(false),
       pipeline_running_(false) {
     
@@ -86,6 +124,11 @@ GstPlayer::GstPlayer()
 
 GstPlayer::~GstPlayer() {
     CleanupPipeline();
+    
+    if (shm_allocator_) {
+        gst_object_unref(shm_allocator_);
+        shm_allocator_ = nullptr;
+    }
     
     if (shm_data_ && shm_data_ != MAP_FAILED) {
         munmap(shm_data_, shm_size_);
@@ -272,7 +315,15 @@ bool GstPlayer::SetupPipeline() {
     g_object_set(capsfilter_, "caps", caps, nullptr);
     gst_caps_unref(caps);
     
-    // Configure appsink
+    // Setup shared memory first
+    if (!SetupSharedMemory()) {
+        return false;
+    }
+    
+    // Create custom allocator for zero-copy
+    SetupShmAllocator();
+    
+    // Configure appsink to use our allocator
     g_object_set(appsink_,
                  "emit-signals", FALSE,
                  "enable-last-sample", FALSE,
@@ -285,12 +336,25 @@ bool GstPlayer::SetupPipeline() {
     GstAppSinkCallbacks callbacks = {nullptr, nullptr, OnNewSample, nullptr};
     gst_app_sink_set_callbacks(GST_APP_SINK(appsink_), &callbacks, this, nullptr);
     
-    // Setup shared memory
-    if (!SetupSharedMemory()) {
-        return false;
-    }
-    
     return true;
+}
+
+void GstPlayer::SetupShmAllocator() {
+    // 创建自定义共享内存分配器
+    shm_allocator_ = static_cast<GstAllocator*>(g_object_new(GST_TYPE_ALLOCATOR, NULL));
+    g_strlcpy(shm_allocator_->mem_type, "GstShmMemory", GST_MEM_TYPE_NAME_LENGTH);
+    
+    // 设置分配器回调
+    shm_allocator_->alloc = shm_alloc;
+    shm_allocator_->free = shm_free;
+    shm_allocator_->mem_map = shm_mem_map;
+    shm_allocator_->mem_unmap = shm_mem_unmap;
+    shm_allocator_->mem_copy = shm_mem_copy;
+    shm_allocator_->mem_share = shm_mem_share;
+    shm_allocator_->mem_is_span = shm_mem_is_span;
+    
+    // 保存用户数据
+    shm_allocator_->user_data = this;
 }
 
 bool GstPlayer::SetupSharedMemory() {
@@ -378,41 +442,64 @@ void GstPlayer::ProcessFrame(GstSample* sample) {
     GstBuffer* buffer = gst_sample_get_buffer(sample);
     if (!buffer) return;
     
-    // Map buffer for reading
-    GstMapInfo map;
-    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-        return;
-    }
+    // 检查 buffer 是否已经在共享内存中
+    GstMemory* mem = gst_buffer_peek_memory(buffer, 0);
+    bool is_zero_copy = (mem && mem->allocator == shm_allocator_);
     
-    pthread_mutex_lock(&shm_mutex_);
-    
-    // Update frame info
-    GstCaps* caps = gst_sample_get_caps(sample);
-    if (caps) {
-        GstVideoInfo video_info;
-        if (gst_video_info_from_caps(&video_info, caps)) {
-            frame_info_.width = GST_VIDEO_INFO_WIDTH(&video_info);
-            frame_info_.height = GST_VIDEO_INFO_HEIGHT(&video_info);
-            frame_info_.format = GST_VIDEO_INFO_FORMAT(&video_info);
-            frame_info_.size = map.size;
-            
-            for (int i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
-                frame_info_.stride[i] = GST_VIDEO_INFO_PLANE_STRIDE(&video_info, i);
+    if (is_zero_copy) {
+        // 零拷贝路径：数据已经在共享内存中
+        pthread_mutex_lock(&shm_mutex_);
+        
+        GstCaps* caps = gst_sample_get_caps(sample);
+        if (caps) {
+            GstVideoInfo video_info;
+            if (gst_video_info_from_caps(&video_info, caps)) {
+                frame_info_.width = GST_VIDEO_INFO_WIDTH(&video_info);
+                frame_info_.height = GST_VIDEO_INFO_HEIGHT(&video_info);
+                frame_info_.format = GST_VIDEO_INFO_FORMAT(&video_info);
+                frame_info_.size = gst_buffer_get_size(buffer);
+                
+                for (int i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+                    frame_info_.stride[i] = GST_VIDEO_INFO_PLANE_STRIDE(&video_info, i);
+                }
             }
         }
+        
+        frame_info_.ready = true;
+        pthread_mutex_unlock(&shm_mutex_);
+    } else {
+        // 回退路径：需要拷贝数据（兼容性处理）
+        GstMapInfo map;
+        if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+            return;
+        }
+        
+        pthread_mutex_lock(&shm_mutex_);
+        
+        GstCaps* caps = gst_sample_get_caps(sample);
+        if (caps) {
+            GstVideoInfo video_info;
+            if (gst_video_info_from_caps(&video_info, caps)) {
+                frame_info_.width = GST_VIDEO_INFO_WIDTH(&video_info);
+                frame_info_.height = GST_VIDEO_INFO_HEIGHT(&video_info);
+                frame_info_.format = GST_VIDEO_INFO_FORMAT(&video_info);
+                frame_info_.size = map.size;
+                
+                for (int i = 0; i < GST_VIDEO_MAX_PLANES; i++) {
+                    frame_info_.stride[i] = GST_VIDEO_INFO_PLANE_STRIDE(&video_info, i);
+                }
+            }
+        }
+        
+        // 拷贝数据到共享内存
+        size_t copy_size = std::min(map.size, shm_size_);
+        memcpy(shm_data_, map.data, copy_size);
+        
+        frame_info_.ready = true;
+        pthread_mutex_unlock(&shm_mutex_);
+        
+        gst_buffer_unmap(buffer, &map);
     }
-    
-    // Copy data to shared memory
-    // Note: In a true zero-copy implementation, we would use GStreamer's
-    // memory allocator that allocates directly from shared memory
-    size_t copy_size = std::min(map.size, shm_size_);
-    memcpy(shm_data_, map.data, copy_size);
-    
-    frame_info_.ready = true;
-    
-    pthread_mutex_unlock(&shm_mutex_);
-    
-    gst_buffer_unmap(buffer, &map);
 }
 
 // Module registration

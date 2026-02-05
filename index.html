@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GST Player - WebGL Renderer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #1a1a1a;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-family: Arial, sans-serif;
+        }
+        #container {
+            margin-top: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        #canvas-container {
+            position: relative;
+            border: 2px solid #333;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+        #gl-canvas {
+            display: block;
+            background: #000;
+        }
+        #info {
+            margin-top: 20px;
+            color: #fff;
+            font-size: 14px;
+            text-align: center;
+            max-width: 800px;
+        }
+        .controls {
+            margin: 10px 0;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 14px;
+            cursor: pointer;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        #fps-counter {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #0f0;
+            font-size: 16px;
+            font-weight: bold;
+            text-shadow: 1px 1px 2px black;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1 style="color: #4CAF50;">GStreamer Player with WebGL</h1>
+        <div class="controls">
+            <button id="play-btn">Play</button>
+            <button id="pause-btn">Pause</button>
+            <button id="stop-btn">Stop</button>
+        </div>
+        <div id="canvas-container">
+            <canvas id="gl-canvas" width="1920" height="1080" style="max-width: 100%; height: auto;"></canvas>
+            <div id="fps-counter">FPS: 0 | Frames: 0</div>
+        </div>
+        <div id="info">
+            <p>This demo renders GStreamer video frames to WebGL via shared memory.</p>
+            <p id="status">Waiting for shared memory info...</p>
+        </div>
+    </div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+        const GstPlayer = require('./index');
+        
+        let gl;
+        let shaderProgram;
+        let texture;
+        let player;
+        let frameCount = 0;
+        let lastTime = performance.now();
+        let fps = 0;
+        
+        // Vertex shader
+        const vsSource = `
+            attribute vec4 aVertexPosition;
+            attribute vec2 aTextureCoord;
+            varying highp vec2 vTextureCoord;
+            void main() {
+                gl_Position = aVertexPosition;
+                vTextureCoord = aTextureCoord;
+            }
+        `;
+        
+        // Fragment shader for RGBA
+        const fsSource = `
+            precision highp float;
+            varying highp vec2 vTextureCoord;
+            uniform sampler2D uSampler;
+            void main() {
+                vec4 color = texture2D(uSampler, vTextureCoord);
+                gl_FragColor = color;
+            }
+        `;
+        
+        function initGL() {
+            const canvas = document.getElementById('gl-canvas');
+            gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+            
+            if (!gl) {
+                document.getElementById('status').textContent = 'WebGL not supported!';
+                return false;
+            }
+            
+            console.log('WebGL initialized:', gl.getParameter(gl.VERSION));
+            return true;
+        }
+        
+        function initShaderProgram(vsSource, fsSource) {
+            const vertexShader = loadShader(gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = loadShader(gl.FRAGMENT_SHADER, fsSource);
+            
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+            
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                console.error('Shader program failed:', gl.getProgramInfoLog(shaderProgram));
+                return null;
+            }
+            
+            return shaderProgram;
+        }
+        
+        function loadShader(type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            
+            return shader;
+        }
+        
+        function initBuffers() {
+            // Position buffer
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            const positions = [
+                -1.0,  1.0,
+                 1.0,  1.0,
+                -1.0, -1.0,
+                 1.0, -1.0,
+            ];
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+            
+            // Texture coordinate buffer
+            const textureCoordBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, textureCoordBuffer);
+            const textureCoords = [
+                0.0, 0.0,
+                1.0, 0.0,
+                0.0, 1.0,
+                1.0, 1.0,
+            ];
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(textureCoords), gl.STATIC_DRAW);
+            
+            return {
+                position: positionBuffer,
+                textureCoord: textureCoordBuffer,
+            };
+        }
+        
+        function initTexture() {
+            texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            
+            // Set placeholder texture
+            gl.texImage2D(
+                gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255])
+            );
+            
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        }
+        
+        function renderScene() {
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            
+            gl.useProgram(shaderProgram);
+            
+            // Set position attribute
+            const buffers = initBuffers();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+            const vertexPosition = gl.getAttribLocation(shaderProgram, 'aVertexPosition');
+            gl.vertexAttribPointer(vertexPosition, 2, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(vertexPosition);
+            
+            // Set texture coordinate attribute
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffers.textureCoord);
+            const textureCoord = gl.getAttribLocation(shaderProgram, 'aTextureCoord');
+            gl.vertexAttribPointer(textureCoord, 2, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(textureCoord);
+            
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.uniform1i(gl.getUniformLocation(shaderProgram, 'uSampler'), 0);
+            
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+        
+        function updateTexture(width, height, data) {
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA,
+                width,
+                height,
+                0,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                data
+            );
+        }
+        
+        function updateFPS() {
+            const now = performance.now();
+            const delta = now - lastTime;
+            
+            if (delta >= 1000) {
+                fps = Math.round((frameCount - lastFrameCount) * 1000 / delta);
+                lastTime = now;
+                lastFrameCount = frameCount;
+            }
+            
+            document.getElementById('fps-counter').textContent = 
+                `FPS: ${fps} | Frames: ${frameCount}`;
+        }
+        
+        let lastFrameCount = 0;
+        
+        // Listen for new frames from main process
+        ipcRenderer.on('new-frame', (event, frameInfo) => {
+            frameCount++;
+            
+            // Get the frame data directly from addon
+            const frame = player.getFrame();
+            if (frame && frame.data) {
+                updateTexture(frame.width, frame.height, new Uint8Array(frame.data));
+                renderScene();
+                updateFPS();
+            }
+        });
+        
+        // Listen for shared memory info
+        ipcRenderer.on('shm-info', (event, shmInfo) => {
+            document.getElementById('status').textContent = 
+                `Shared Memory: ${shmInfo.name} (${(shmInfo.size / 1024 / 1024).toFixed(2)} MB)`;
+        });
+        
+        // Controls
+        document.getElementById('play-btn').addEventListener('click', () => {
+            if (player) player.play();
+        });
+        
+        document.getElementById('pause-btn').addEventListener('click', () => {
+            if (player) player.pause();
+        });
+        
+        document.getElementById('stop-btn').addEventListener('click', () => {
+            if (player) player.stop();
+        });
+        
+        // Initialize
+        window.addEventListener('load', () => {
+            if (initGL()) {
+                shaderProgram = initShaderProgram(vsSource, fsSource);
+                initTexture();
+                
+                // Create local player instance for renderer
+                player = new GstPlayer();
+                
+                document.getElementById('status').textContent = 'Ready - Waiting for video...';
+            }
+        });
+    </script>
+</body>
+</html>

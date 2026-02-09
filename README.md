@@ -24,6 +24,18 @@ npm run build
 - GStreamer 1.14.4+ development libraries
 - Windows: GStreamer development files must be in system PATH
 
+## Running the Example
+
+```bash
+cd example
+npm install
+npm start
+```
+
+The example uses Electron and displays a test pattern at 1920x1080 resolution at 24 FPS.
+
+![WebGLGstPlayer Example](./images/image.png)
+
 ## Usage
 
 ### WebGLGstPlayer (Recommended)
@@ -81,16 +93,6 @@ player.addAppSinkCallback('sink', (event, ...args) => {
 // Set state to playing
 player.setState(player.GST_STATE_PLAYING);
 ```
-
-## Running the Example
-
-```bash
-cd example
-npm install
-npm start
-```
-
-The example uses Electron and displays a test pattern at 1920x1080 resolution at 24 FPS.
 
 ## API
 

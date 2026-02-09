@@ -1,0 +1,25 @@
+{
+  "name": "node-gst-player",
+  "version": "0.0.1",
+  "description": "A Node.js addon for playing media using GStreamer",
+  "license": "MIT",
+  "keywords": [
+    "node-addon",
+    "gstreamer"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YiguiDing/node-gst-player"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "node-gyp configure && node-gyp rebuild"
+  },
+  "dependencies": {
+    "@electron/remote": "^2.1.3",
+    "bindings": "^1.5.0",
+    "node-addon-api": "^7.1.1",
+    "node-gyp": "^12.2.0"
+  }
+}

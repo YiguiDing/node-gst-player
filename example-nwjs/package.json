@@ -1,0 +1,15 @@
+{
+  "name": "helloworld",
+  "main": "index.html",
+  "license": "MIT",
+  "scripts": {
+    "start": "nw ."
+  },
+  "dependencies": {
+    "node-gst-player": "../"
+  },
+  "devDependencies": {
+    "@types/nw.js": "^0.92.0",
+    "nw": "^0.107.0"
+  }
+}
